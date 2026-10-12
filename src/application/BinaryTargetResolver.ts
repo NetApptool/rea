@@ -26,7 +26,10 @@ import {
   validateDosComLength,
   type ExecutableFormatHint,
 } from "../domain/dosCom.js";
-import { admitRawBinary } from "../domain/rawBinary.js";
+import {
+  admitRawBinary,
+  rawBinarySelectionError,
+} from "../domain/rawBinary.js";
 import type { BinaryArchitecture } from "../domain/binaryTargetTypes.js";
 import { mzWindowsHeaderOffset } from "../domain/dosMz.js";
 import {
@@ -93,7 +96,7 @@ export const parseBinaryTarget = async (
             new BinaryTargetError(
               path,
               "raw-binary format requires an executable target kind",
-              { constraint: "file_format_rejected" },
+              { constraint: "load_selection_rejected" },
             ),
           );
         const admitted = admitRawBinary({
@@ -103,8 +106,8 @@ export const parseBinaryTarget = async (
         });
         if (!admitted.ok)
           return err(
-            new BinaryTargetError(path, admitted.error, {
-              constraint: "file_format_rejected",
+            new BinaryTargetError(path, admitted.error.reason, {
+              constraint: admitted.error.constraint,
             }),
           );
         return ok({
@@ -119,12 +122,16 @@ export const parseBinaryTarget = async (
           entryPointSource: admitted.value.entryPointSource,
         });
       }
-      if (architecture !== undefined || entryPoint !== undefined)
+      const pairing = rawBinarySelectionError({
+        ...(formatHint === undefined ? {} : { format: formatHint }),
+        architecture,
+        entryPoint,
+      });
+      if (pairing !== undefined)
         return err(
-          new BinaryTargetError(
-            path,
-            "architecture and entry_point apply only with format=raw-binary",
-          ),
+          new BinaryTargetError(path, pairing, {
+            constraint: "load_selection_rejected",
+          }),
         );
       if (formatHint === "dos-com") {
         if (targetKind !== undefined && targetKind !== "executable")
@@ -132,7 +139,7 @@ export const parseBinaryTarget = async (
             new BinaryTargetError(
               path,
               "DOS COM format requires an executable target kind",
-              { constraint: "file_format_rejected" },
+              { constraint: "load_selection_rejected" },
             ),
           );
         const length = validateDosComLength(metadata.size);
@@ -200,16 +207,24 @@ export const parseBinaryTarget = async (
     if (cause instanceof AnalysisCancelledError) return err(cause);
     if (cause instanceof BinaryTargetError) return err(cause);
     if (!(cause instanceof Error)) throw cause;
-    const code = filesystemErrorCode(cause);
-    if (code === undefined) throw cause;
-    return err(
-      new BinaryTargetError(
-        candidate,
-        targetFailureReason(code, cause.message),
-        { cause },
-      ),
-    );
+    const failure = classifyBinaryTargetFilesystemFailure(candidate, cause);
+    if (failure === undefined) throw cause;
+    return err(failure);
   }
+};
+
+/** Classify a filesystem failure while reading a previously selected target. */
+export const classifyBinaryTargetFilesystemFailure = (
+  path: string,
+  cause: unknown,
+): BinaryTargetError | undefined => {
+  if (!(cause instanceof Error)) return undefined;
+  const code = filesystemErrorCode(cause);
+  return code === undefined
+    ? undefined
+    : new BinaryTargetError(path, targetFailureReason(code, cause.message), {
+        cause,
+      });
 };
 
 const filesystemErrorCode = (cause: Error): string | undefined => {
@@ -250,6 +265,7 @@ const detectArtifactFormat = async (
       BinaryTarget["format"],
       | "analysis-database"
       | "mach-o"
+      | "mach-o-universal"
       | "elf"
       | "pe"
       | "dos-mz"
@@ -278,12 +294,15 @@ const detectArtifactFormat = async (
     if (lower.endsWith(".app")) return "app-pack";
     return zipPackageFormatForPath(lower) ?? "zip";
   }
+  // Binary plists, including keyed archives, often use other extensions.
+  if (observed.bytesRead === 8 && magic.equals(Buffer.from("bplist00")))
+    return "plist";
   const named = namedArtifactFormat(lower);
   if (named !== undefined) return named;
   if (
     lower.endsWith(".pkg") &&
     observed.bytesRead >= 4 &&
-    magic.subarray(0, 4).toString("ascii") === "xar!"
+    magic.subarray(0, 4).equals(Buffer.from("xar!"))
   )
     return "pkg";
   if (lower.endsWith(".dmg")) {
@@ -294,7 +313,7 @@ const detectArtifactFormat = async (
       const trailer = Buffer.alloc(4);
       const read = await handle.read(trailer, 0, trailer.length, size - 512);
       throwIfTargetResolutionCancelled(signal);
-      if (read.bytesRead === 4 && trailer.toString("ascii") === "koly")
+      if (read.bytesRead === 4 && trailer.equals(Buffer.from("koly")))
         return "dmg";
     }
   }
@@ -315,6 +334,7 @@ const isArchiveFormat = (
     BinaryTarget["format"],
     | "analysis-database"
     | "mach-o"
+    | "mach-o-universal"
     | "elf"
     | "pe"
     | "dos-mz"
