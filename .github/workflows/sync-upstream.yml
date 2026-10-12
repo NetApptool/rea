@@ -1,0 +1,41 @@
+name: Sync Upstream (morluto/rea)
+
+on:
+  schedule:
+    # 每天 UTC 03:00 (北京时间 11:00) 自动同步
+    - cron: '0 3 * * *'
+  workflow_dispatch: # 支持手动一键触发
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync with upstream
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/morluto/rea.git
+          git fetch upstream --tags
+          git fetch upstream main
+
+          git checkout main
+          # 尝试直接合并 upstream/main
+          if ! git merge upstream/main -m "chore(sync): sync upstream morluto/rea [skip ci]"; then
+            echo "Auto-merge failed, backup local changes to backup branch and reset to upstream"
+            git checkout -b "backup-$(date +%Y%m%d%H%M%S)"
+            git push origin HEAD
+            git checkout main
+            git reset --hard upstream/main
+          fi
+
+          git push origin main
+          git push origin --tags
